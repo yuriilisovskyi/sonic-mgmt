@@ -26,6 +26,7 @@ Using of pytest does not mean that ansible will no long be used. Ansible is stil
 * [Write and run pytest](tests/README.md)
 * [Testplan](testplan)
 * [Test Reporting](/test_reporting/README.md)
+* [Validation repository architecture](validation-repository-architecture.md)
 * [api_wiki](api_wiki/README.md)
 * [Spytest](/spytest)
   * [Introduction](/spytest/Doc/intro.md)
