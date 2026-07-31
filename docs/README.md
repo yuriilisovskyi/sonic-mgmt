@@ -25,6 +25,7 @@ Using of pytest does not mean that ansible will no long be used. Ansible is stil
 * [Testbed](testbed/README.md)
 * [Write and run pytest](tests/README.md)
 * [Testplan](testplan)
+  * [SNMP, gRPC and RESTCONF test strategy](testplan/SNMP-gRPC-RESTCONF-test-strategy.md)
 * [Test Reporting](/test_reporting/README.md)
 * [api_wiki](api_wiki/README.md)
 * [Spytest](/spytest)
