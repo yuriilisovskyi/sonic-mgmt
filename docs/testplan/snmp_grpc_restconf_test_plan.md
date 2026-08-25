@@ -137,14 +137,14 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/snmp/conftest.py
+**sonic-mgmt coverage:** `tests/snmp/conftest.py`, `tests/snmp/test_snmp_v2mib.py`
 
 **Test Steps:**
 
 1. Read `/etc/sonic/snmp.yml` and inventory every `snmp_rocommunity`, `snmp_rocommunities`, `snmp_rwcommunity`, and `snmp_rwcommunities` value used by the automated fixture.
 2. Compare those values with `redis-cli -n 4 keys 'SNMP_COMMUNITY*'` / `show snmpcommunity`; add each missing RO or RW community with `sudo config snmp community add <community> ro|rw`.
 3. If `snmp_location` is defined, compare it with `redis-cli -n 4 keys 'SNMP|LOCATION*'` and provision it with `sudo config snmp location add <location>` when absent.
-4. For every configured RO community, run `snmpget -v2c -c <community> <mgmt_ip> sysDescr.0`; expect a successful response containing a non-empty description.
+4. For every configured RO community, run `snmpget -v2c -c <community> <mgmt_ip> sysName.0 sysDescr.0 sysLocation.0 sysContact.0`; require the hostname, configured location/contact, kernel, HWSKU, SONiC version, and Debian version checks performed by `test_snmp_v2mib.py`.
 5. Query with `wrongcomm`; expect timeout or authorization failure. Add and then delete `tmp_ro` with `sudo config snmp community add tmp_ro ro` and `sudo config snmp community del tmp_ro`.
 6. Repeat the query with `tmp_ro`; expect no response after deletion and confirm the original inventory communities remain in CONFIG_DB.
 
@@ -456,7 +456,7 @@ Placeholder objects (`ifPhysAddress`, `ifLastChange`, `ifSpecific`, `ifLinkUpDow
 
 gNOI System, File, and OS are registered on supporting images. Ping and Traceroute return `Unimplemented`. FactoryReset, Healthz, Containerz, Debug, ORAS, SonicService/JWT, and gNSI are build-dependent and must be gated by runtime inventory.
 
-Existing `tests/gnmi` and `tests/telemetry` cases cover Capabilities, certificate auth, CONFIG_DB incremental/full replace and subscribe, APPL_DB DASH VNET, COUNTERS_DB get/poll/sample, selected events, System Time, cold/warm reboot, OS Verify/Activate, and KillProcess. The cases below fill remaining functional gaps.
+Existing `tests/gnmi` and `tests/telemetry` cases cover Capabilities, certificate auth, CONFIG_DB incremental/full replace and subscribe, APPL_DB DASH VNET, COUNTERS_DB get/poll/sample, selected events, System Time, cold/warm reboot, OS Verify/Activate, and KillProcess. KillProcess automation is currently disabled by `tests_mark_conditions.yaml` pending a rewrite. The cases below fill remaining functional gaps.
 
 Setup for gNMI/gNOI:
 
@@ -551,7 +551,7 @@ Setup for gNMI/gNOI:
 
 #### TC 6: Incremental Set
 
-**Test Objective:** Verify delete, replace, update, and create-if-absent on CONFIG_DB leaves and containers.
+**Test Objective:** Verify incremental CONFIG_DB leaf updates and rejection of an invalid table path.
 
 **Testbed:** Any
 
@@ -902,7 +902,7 @@ Setup for gNMI/gNOI:
 2. Send KillProcess for that service with `restart:true, signal:1`; require return code 0 and require the host service to run again.
 3. Send names `gnmi`, `nonexistent`, and empty string; require failure with the exact D-Bus unsupported/no-service message used by the automated parameter matrix.
 4. Send invalid or empty `restart` values and require failure with `panic` in the response, matching the automated assertion; send `signal:2` and require `KillProcess only supports SIGNAL_TERM (option 1)`.
-5. After every parameter case, wait for critical processes and require `critical_services_fully_started`; retain the suite's skip when a selected service was not initially running.
+5. After every parameter case, wait for critical processes and require `critical_services_fully_started`; retain the per-service skip when a selected service was not initially running. The current automated module is globally skipped by `tests_mark_conditions.yaml` until its restart-noise issues are rewritten.
 
 #### TC 6: Ping and Traceroute unimplemented
 
