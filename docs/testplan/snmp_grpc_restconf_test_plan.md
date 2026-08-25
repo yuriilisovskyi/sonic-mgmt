@@ -141,11 +141,12 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Show configured communities with `show snmpcommunity` and `sonic-db-cli CONFIG_DB keys 'SNMP_COMMUNITY|*'`.
-2. Query with the valid RO community: `snmpget -v2c -c <rocommunity> <mgmt_ip> sysDescr.0` and confirm a non-empty description.
-3. Query with a wrong community: `snmpget -v2c -c wrongcomm <mgmt_ip> sysDescr.0` and confirm timeout or authorization failure; `docker logs snmp` must not crash.
-4. Add a temporary community with `sudo config snmp community add tmp_ro ro`, query successfully, then delete it with `sudo config snmp community del tmp_ro`.
-5. Repeat the query with `tmp_ro` and confirm it is denied after deletion.
+1. Read `/etc/sonic/snmp.yml` and inventory every `snmp_rocommunity`, `snmp_rocommunities`, `snmp_rwcommunity`, and `snmp_rwcommunities` value used by the automated fixture.
+2. Compare those values with `redis-cli -n 4 keys 'SNMP_COMMUNITY*'` / `show snmpcommunity`; add each missing RO or RW community with `sudo config snmp community add <community> ro|rw`.
+3. If `snmp_location` is defined, compare it with `redis-cli -n 4 keys 'SNMP|LOCATION*'` and provision it with `sudo config snmp location add <location>` when absent.
+4. For every configured RO community, run `snmpget -v2c -c <community> <mgmt_ip> sysDescr.0`; expect a successful response containing a non-empty description.
+5. Query with `wrongcomm`; expect timeout or authorization failure. Add and then delete `tmp_ro` with `sudo config snmp community add tmp_ro ro` and `sudo config snmp community del tmp_ro`.
+6. Repeat the query with `tmp_ro`; expect no response after deletion and confirm the original inventory communities remain in CONFIG_DB.
 
 #### TC 3: SNMPv3
 
@@ -211,25 +212,9 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 4. Restart only the subagent (`docker exec snmp supervisorctl restart snmp-subagent`) and repeat the walk.
 5. Confirm `docker exec snmp supervisorctl status` remains RUNNING.
 
-#### TC 7: Multi-ASIC indexes
+#### TC 7: LLDP local and remote tables
 
-**Test Objective:** Verify interface, route, and neighbor SNMP rows from every frontend namespace have unique indexes.
-
-**Testbed:** Hardware
-
-**sonic-mgmt coverage:** tests/snmp/test_snmp_interfaces.py
-
-**Test Steps:**
-
-1. List ASICs with `show platform summary` and `ip netns list`.
-2. For each namespace, collect ports with `sonic-db-cli -n asic0 APPL_DB keys 'PORT_TABLE:*'` (repeat per ASIC).
-3. Walk `ifDescr`/`ifIndex` and confirm every frontend port alias appears exactly once.
-4. Walk `ipNetToMediaPhysAddress` and `ipCidrRouteDest` and confirm no colliding indexes across namespaces.
-5. Compare SNMP ifIndex uniqueness: no duplicate index values in the walk.
-
-#### TC 8: LLDP local capabilities
-
-**Test Objective:** Verify `lldpLocSysCapSupported` and `lldpLocSysCapEnabled` match local LLDP state.
+**Test Objective:** Verify LLDP local chassis, port, management-address, capability, and remote-neighbor MIB data against LLDP and topology state.
 
 **Testbed:** Any
 
@@ -237,19 +222,20 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Confirm LLDP is running: `systemctl is-active lldp` and `show lldp table`.
-2. Read local chassis from Redis: `sonic-db-cli APPL_DB hgetall LLDP_LOC_CHASSIS`.
-3. GET `.1.0.8802.1.1.2.1.3.5.0` (`lldpLocSysCapSupported`) and `.1.0.8802.1.1.2.1.3.6.0` (`lldpLocSysCapEnabled`).
-4. Decode the BITS values and compare with APPL_DB / `docker exec lldp lldpcli show chassis`.
-5. If the platform allows changing advertised capabilities, change them, wait for refresh, and confirm the OIDs update.
+1. Confirm LLDP is active with `systemctl is-active lldp`; collect minigraph neighbors from every frontend ASIC and `docker exec lldp lldpcli show neighbors -f keyvalue`.
+2. Walk `lldpLocalSystemData` (`.1.0.8802.1.1.2.1.3`) and require non-empty `lldpLocChassisIdSubtype`, chassis ID, system name, and system description without `No Such Object`.
+3. For every SNMP interface named `Ethernet*` or `eth*`, require `lldpLocPortIdSubtype`, `lldpLocPortId`, and `lldpLocPortDesc`; on a non-modular DUT also require all local management-address table fields.
+4. GET `lldpLocSysCapSupported` and `lldpLocSysCapEnabled`, decode their BITS values, and compare them with `lldpcli show chassis` / `LLDP_LOC_CHASSIS` in APPL_DB.
+5. Walk `lldpRemTable`; require chassis, port, system, description, and supported/enabled capability fields for at least 80% of non-server minigraph neighbors.
+6. Walk `lldpRemManAddrTable`; its populated interface count must equal the `lldpctl` neighbors that advertise a management IP, excluding `eth0` and internal backplane links.
 
-#### TC 9: ifNumber lifecycle
+#### TC 8: ifNumber lifecycle
 
 **Test Objective:** Verify `ifNumber` equals unique `ifTable` rows through VLAN/LAG add and delete.
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/snmp/test_snmp_interfaces.py
+**sonic-mgmt coverage:** Not covered
 
 **Test Steps:**
 
@@ -259,25 +245,9 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 4. Create a PortChannel with `sudo config portchannel add PortChannel4094` (use a free ID) and confirm a new SNMP row and incremented `ifNumber`.
 5. Delete the VLAN and PortChannel (`sudo config vlan del 4094`, `sudo config portchannel del PortChannel4094`) and confirm `ifNumber` and rows return to baseline with no stale ifIndex.
 
-#### TC 10: MIB-II 32-bit counters
+#### TC 9: MIB-II and IF-MIB interface counters
 
-**Test Objective:** Verify 32-bit interface counters track COUNTERS_DB deltas for generated traffic.
-
-**Testbed:** Hardware
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. Enable port counters: `sudo counterpoll port enable` and `show counterpoll`.
-2. Baseline SNMP `ifInOctets`/`ifOutOctets`/`ifInUcastPkts`/`ifInErrors` for a test port and Redis `sonic-db-cli COUNTERS_DB hget COUNTERS:<oid> SAI_PORT_STAT_IF_IN_OCTETS`.
-3. Send a known unicast stream from PTF to the port, then broadcast/multicast and (if possible) error/drop traffic.
-4. Re-read SNMP and COUNTERS_DB; assert deltas match in direction and type, including 32-bit wrap/mask.
-5. Clear or restore counterpoll as required by the lab.
-
-#### TC 11: IF-MIB HC counters
-
-**Test Objective:** Verify 64-bit IF-MIB counters match COUNTERS_DB and agree with the low 32 bits of MIB-II counters.
+**Test Objective:** Verify 32-bit MIB-II and 64-bit IF-MIB counters track COUNTERS_DB deltas, preserve width semantics, and agree on their low 32 bits.
 
 **Testbed:** Hardware
 
@@ -285,29 +255,15 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Read `ifHCInOctets` (`.1.3.6.1.2.1.31.1.1.1.6`) and `ifInOctets` for the same ifIndex.
-2. Generate enough traffic to increase both counters.
-3. Compare 64-bit SNMP values with COUNTERS_DB `SAI_PORT_STAT_IF_IN_OCTETS` / `SAI_PORT_STAT_IF_OUT_OCTETS`.
-4. Confirm `(ifHCInOctets & 0xffffffff) == ifInOctets` (and the outbound pair) after the same sample.
-5. Repeat for unicast/multicast/broadcast HC packet counters.
+1. Enable port polling with `sudo counterpoll port enable`; select a test interface and map it to its COUNTERS_DB OID through `COUNTERS_PORT_NAME_MAP`.
+2. In one sampling window, read `ifInOctets`, `ifOutOctets`, unicast/multicast/broadcast packet counters, and their `ifHC*` counterparts for the same ifIndex; read the matching `SAI_PORT_STAT_*` values from COUNTERS_DB.
+3. Send known unicast, multicast, and broadcast streams from PTF/TGen and, where supported, error/drop traffic; wait for the SNMP cache and COUNTERS_DB to update.
+4. Assert 32-bit and 64-bit SNMP deltas match COUNTERS_DB in direction and packet class, and all MIB objects use the expected Counter32 or Counter64 type.
+5. For each octet/packet pair sampled together, assert `(ifHCValue & 0xffffffff) == ifValue`; run enough traffic or seed a supported test counter to exercise 32-bit wrap without a 64-bit reset.
+6. Stop traffic and restore the original counter-polling state.
 
-#### TC 12: Counter object types
 
-**Test Objective:** Verify port, LAG/RIF, and management-interface counter semantics.
-
-**Testbed:** Hardware
-
-**sonic-mgmt coverage:** tests/snmp/test_snmp_interfaces.py
-
-**Test Steps:**
-
-1. Identify a physical port, a PortChannel, a VLAN/RIF, and `eth0` from `show interfaces status` and `show interfaces counters`.
-2. Walk `ifInOctets`/`ifOutOctets` for each type.
-3. For PortChannel, sum member COUNTERS_DB values and compare with the LAG SNMP counters.
-4. For the management interface, confirm documented zero or Linux-counter behavior.
-5. Confirm physical ports track COUNTERS_DB directly.
-
-#### TC 13: ifName, ifHighSpeed, and ifAlias
+#### TC 10: ifName, ifHighSpeed, and ifAlias
 
 **Test Objective:** Verify IF-MIB name, speed, and alias track CONFIG_DB through description and LAG changes.
 
@@ -317,13 +273,14 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. From `show interfaces status`, pick Ethernet0 and record alias, speed, and description.
-2. GET `ifName`, `ifHighSpeed` (`.1.3.6.1.2.1.31.1.1.1.15`), and `ifAlias` (`...1.18`) for that ifIndex.
-3. Set description with `sudo config interface description Ethernet0 snmp-alias-test` and poll `ifAlias` until it matches.
-4. Compare `ifHighSpeed` with `sonic-db-cli CONFIG_DB hget 'PORT|Ethernet0' speed` (Mbps). For speeds > 4 Gbps also check `ifSpeed` cap at 4294967295.
-5. If a LAG exists, confirm LAG `ifHighSpeed` equals the sum of member speeds.
+1. Collect persistent CONFIG_DB facts and `show interface status` for every frontend ASIC; include physical-port aliases, PortChannels, and the management interface.
+2. Walk `ifName`, `ifIndex`, `ifType`, `ifMtu`, `ifAdminStatus`, `ifOperStatus`, `ifAlias`, `ifSpeed`, and `ifHighSpeed`; require every physical alias and PortChannel from every ASIC and each management interface to be present.
+3. Compare MTU (except the automated test's `eth0` exemption), description, and admin status with CONFIG_DB; compare physical-port and LAG operational status with APPL_DB. On single-ASIC DUTs, also compare management-interface fields and `MGMT_PORT_TABLE` operational status; on multi-ASIC DUTs, require only management-interface presence, matching the automated test's current limitation.
+4. Require `ifType=6` for physical/management Ethernet and `ifType=161` for PortChannel, and require unique ifIndex values with the implemented index relation.
+5. For each physical port, require `ifSpeed` in bps when representable; above the Counter32 maximum require `ifSpeed=4294967295` and `ifHighSpeed` equal to CONFIG_DB speed in Mbps.
+6. Set `sudo config interface description Ethernet0 snmp-alias-test`; poll `ifAlias` until it changes, then restore the original description. For an existing LAG, also verify its name, statuses, MTU, description, and type.
 
-#### TC 14: Route table lifecycle
+#### TC 11: Route table lifecycle
 
 **Test Objective:** Verify `ipRouteNextHop`, `ipCidrRouteDest`, and `ipCidrRouteStatus` follow route add/change/delete.
 
@@ -333,13 +290,13 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Record FIB with `show ip route` and SNMP `snmpwalk ... .1.3.6.1.2.1.4.24.4`.
-2. Add a static route: `sudo config route add prefix 192.0.2.0/24 nexthop <nh>`.
-3. Walk `ipCidrRouteDest` and `ipCidrRouteStatus` until the prefix appears with status active(1).
-4. GET `ipRouteNextHop` for the matching entry and compare with `show ip route 192.0.2.0/24`.
-5. Change or delete the route (`sudo config route del prefix 192.0.2.0/24 nexthop <nh>`) and confirm the SNMP row disappears.
+1. Run `show ip route 0.0.0.0/0 | grep '*'`; collect every active default-route next hop except routes through `eth0` or `Ethernet-BP`.
+2. Walk `ipCidrRouteTable`. If no eligible default next hop exists, expect no `snmp_cidr_route`; otherwise require one row per eligible next hop with destination `0.0.0.0` and status `active(1)`.
+3. Add a disposable route with `sudo config route add prefix 192.0.2.0/24 nexthop <nh>` and poll `ipCidrRouteDest`, next hop, and status until they match `show ip route 192.0.2.0/24`.
+4. Replace the next hop where the topology permits; expect the old SNMP row to disappear and the new active row to appear.
+5. Delete the route with `sudo config route del prefix 192.0.2.0/24 nexthop <nh>` and confirm no stale route row remains.
 
-#### TC 15: ARP table lifecycle
+#### TC 12: ARP table lifecycle
 
 **Test Objective:** Verify `ipNetToMediaPhysAddress` tracks neighbor add and age/delete.
 
@@ -355,7 +312,7 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 4. Clear the neighbor (`sudo ip neigh del <neigh_ip> dev <if>` or wait for aging) and poll until the SNMP row is gone.
 5. On multi-ASIC hardware, repeat for a neighbor in a non-default namespace.
 
-#### TC 16: Q-BRIDGE FDB
+#### TC 13: Q-BRIDGE FDB
 
 **Test Objective:** Verify `dot1qTpFdbPort` maps VLAN+MAC to the correct ifIndex through learn, move, and age.
 
@@ -365,15 +322,16 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Create or use a VLAN with `show vlan brief` and send a tagged frame from PTF with a unique MAC.
-2. Confirm learning with `show mac` and `sonic-db-cli ASIC_DB keys '*FDB_ENTRY*'`.
-3. Walk `.1.3.6.1.2.1.17.7.1.2.2.1.2` and confirm VLAN+MAC index and port ifIndex.
-4. Move the MAC to another VLAN member from PTF and confirm SNMP updates the port.
-5. Stop traffic, wait for aging (`show mac` empty for that MAC), and confirm the SNMP row is removed.
+1. Clear prior test MACs with `sudo sonic-clear fdb all`; wait until `show mac` contains no dynamic `02:11:22:33:*` entries and require every configured PortChannel and member to be up.
+2. Enumerate running VLAN member ports. From each corresponding PTF port, send one tagged 100/104-byte ICMP frame per permitted VLAN using a unique `02:11:22:33:<port>` source MAC.
+3. Wait up to 40 seconds for `show mac` to learn all sent MACs, then poll SNMP facts / `dot1qTpFdbPort` for up to 60 seconds.
+4. Require the SNMP dynamic-MAC count to equal the sent count; for every VLAN.MAC row, require its bridge-port ifIndex to exist in `ifTable`, and require the number mapped to PortChannels to equal the number sent through PortChannels.
+5. Move one test MAC to another VLAN member and require the SNMP bridge-port mapping to follow the new interface.
+6. Stop traffic, clear or age the test entries, and confirm the corresponding SNMP rows disappear.
 
-#### TC 17: Sensor status
+#### TC 14: Sensor status
 
-**Test Objective:** Verify `entPhySensorStatus` tracks present, unavailable, and faulted platform sensors.
+**Test Objective:** Verify `entPhySensorOperStatus` and sensor metadata track present, unavailable, and faulted platform sensors.
 
 **Testbed:** Hardware
 
@@ -381,13 +339,13 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Collect sensors with `show platform temperature` / `show environment` and `sonic-db-cli STATE_DB keys '*_INFO|*'`.
-2. Walk ENTITY-SENSOR-MIB `.1.3.6.1.2.1.99.1.1.1` and map `entPhySensorStatus` (`.1.3.6.1.2.1.99.1.1.1.5`) to STATE_DB.
-3. If the platform supports it, inject unavailable/fault (remove PSU, unplug transceiver, or platform API) and poll the status OID.
-4. Restore the sensor and confirm status returns to ok.
-5. Do not treat a related operational-status object as a substitute for this OID.
+1. Collect `FAN_INFO`, `PSU_INFO`, `TEMPERATURE_INFO`, and `TRANSCEIVER_INFO` from STATE_DB, then walk ENTITY-MIB and ENTITY-SENSOR-MIB.
+2. For fan tachometers require sensor type `unknown`, precision `0`, scale `units`, value in 1..100, and operational status `ok`, `nonoperational`, or `unavailable`.
+3. For PSU current/voltage/power/temperature and chassis thermals, require the corresponding amperes/volts-DC/watts/celsius type, precision `3`, scale `units`, and one of the allowed operational statuses.
+4. For transceiver temperature, voltage, bias, TX power, and RX power, verify the automated test's OID derivation, type, precision, scale, value conversion, and parent entity against STATE_DB.
+5. Where supported, remove/reinsert a fan or power off/on one PSU outlet and poll both ENTITY and sensor rows; expect absent/unavailable state during the fault and restored values afterward.
 
-#### TC 18: Cisco FRU PSU status
+#### TC 15: Cisco FRU PSU status
 
 **Test Objective:** Verify Cisco FRU PSU status matches STATE_DB for present/OK, absent, and failed.
 
@@ -397,15 +355,15 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. List PSUs with `sudo psuutil status` and `show platform psustatus`.
-2. Walk `.1.3.6.1.4.1.9.9.117.1.1.2.1.2` and map values 2/7/8 to presence/status.
-3. Compare with `sonic-db-cli STATE_DB hgetall 'PSU_INFO|PSU 1'`.
-4. If hardware allows, remove or fail a PSU and poll until SNMP matches STATE_DB.
-5. Reinsert/restore the PSU and confirm SNMP returns to OK.
+1. Run `psuutil numpsus`; on non-VS hardware require return code 0 and require its count to equal the number of SNMP PSU rows.
+2. Sort `PSU_INFO|*` STATE_DB keys naturally and walk Cisco FRU PSU status `.1.3.6.1.4.1.9.9.117.1.1.2.1.2`.
+3. For each indexed PSU, compare `presence` and `status` with SNMP: present+healthy=`2`, present+failed=`7`, and absent=`8`.
+4. Require at least one PSU to report healthy (`2`) before disruptive checks.
+5. If the hardware/PDU permits, power off or remove one redundant PSU; poll until STATE_DB and SNMP both report failed/missing, then restore it and require status `2`.
 
-#### TC 19: Cisco queue stats
+#### TC 16: Cisco queue counter visibility
 
-**Test Objective:** Verify Cisco switch QoS queue counters match queue mapping and generated traffic.
+**Test Objective:** Verify SNMP exposes exactly the counters for configured buffer queues when optimized queue-counter creation is enabled.
 
 **Testbed:** Hardware
 
@@ -413,31 +371,16 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Enable queue polling: `sudo counterpoll queue enable`.
-2. Map queues with `show queue counters Ethernet0` and `sonic-db-cli COUNTERS_DB hgetall COUNTERS_QUEUE_NAME_MAP`.
-3. Walk `.1.3.6.1.4.1.9.9.580.1.5.5.1.4` for the test ifIndex and record counter IDs 1..8.
-4. Send queue-specific traffic (DSCP/TC mapping) from PTF/TGen.
-5. Compare SNMP deltas with `SAI_QUEUE_STAT_*` in COUNTERS_DB for the matching queue OID.
+1. Choose an active, non-internal interface in the selected frontend ASIC and derive its Cisco queue-counter OID `.1.3.6.1.4.1.9.9.580.1.5.5.1.4.<ifIndex>`.
+2. Save the namespace-specific CONFIG_DB, set `DEVICE_METADATA|localhost create_only_config_db_buffers=true`, and identify a `BUFFER_QUEUE` range for the interface; split a single range if necessary so only a subset will be removed.
+3. Reload CONFIG_DB safely, count UC/MC queue rows from `queuestat -p <interface>` (or `queuestat -n <namespace>`) and poll `docker exec snmp snmpwalk ... <queue_oid>`.
+4. Require the SNMP row count to equal the `queuestat` queue count multiplied by four counters per UC queue (or the platform's UC+MC count).
+5. Delete the selected `BUFFER_QUEUE` subset, reload, and require the SNMP count decrease by four or eight rows per removed queue; on Broadcom-DNX VOQ chassis require the documented static count instead.
+6. Restore the saved namespace CONFIG_DB with safe reload.
 
-#### TC 20: Cisco PFC per priority
+#### TC 17: Cisco PFC per-priority and aggregate counters
 
-**Test Objective:** Verify per-priority PFC request/indication counters track SAI PFC 0..7 independently.
-
-**Testbed:** Hardware
-
-**sonic-mgmt coverage:** tests/snmp/test_snmp_pfc_counters.py
-
-**Test Steps:**
-
-1. Enable PFC on the test port (`sudo config interface pfc asymmetric Ethernet0 off` / lossless profile as used in the lab) and `show pfc counters Ethernet0`.
-2. Baseline SNMP `.1.3.6.1.4.1.9.9.813.1.2.1.2` (prioRequests) and `.1.3.6.1.4.1.9.9.813.1.2.1.3` (prioIndications) for priorities 0..7.
-3. Generate PFC on a single priority from the peer/TGen.
-4. Confirm only that priority’s TX/RX SNMP counters increase, matching `SAI_PORT_STAT_PFC_<n>_TX_PKTS` / `_RX_PKTS`.
-5. Repeat for another priority and confirm independence.
-
-#### TC 21: Cisco PFC aggregates
-
-**Test Objective:** Verify aggregate PFC counters equal the sum of priorities (and LAG members).
+**Test Objective:** Verify required PFC MIB objects exist and per-priority plus aggregate request/indication counters track SAI PFC counters.
 
 **Testbed:** Hardware
 
@@ -445,13 +388,15 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Read per-priority SNMP counters and aggregate OIDs `.1.3.6.1.4.1.9.9.813.1.1.1.1` / `.1.3.6.1.4.1.9.9.813.1.1.1.2`.
-2. Sum priorities 0..7 from COUNTERS_DB and from SNMP.
-3. If the DUT is a LAG, sum members and compare with the LAG row.
-4. If aggregate SNMP equals only priority 3, record a defect; otherwise require full-sum equality.
-5. Generate multi-priority PFC and re-check the sums.
+1. Collect SNMP interface facts and examine every physical interface whose description contains `Ethernet`; skip the Arista-7060X6 `PT0` management-port exception used by the automated test.
+2. For every selected interface, require `cpfcIfRequests`, `cpfcIfIndications`, `requestsPerPriority`, and `indicationsPerPriority` to be present.
+3. Enable the lab lossless/PFC profile and baseline aggregate counters plus all priorities 0..7 in SNMP and matching `SAI_PORT_STAT_PFC_<n>_TX_PKTS` / `_RX_PKTS` COUNTERS_DB fields.
+4. Generate PFC on one priority from the peer/TGen; require only that priority's request/indication values to increase and match the corresponding SAI deltas.
+5. Generate PFC on a second priority, then require aggregate request/indication deltas to equal the sum of all eight priority deltas; for a LAG, also compare the sum of member counters.
+6. Restore the original PFC profile and confirm all required MIB fields remain present.
 
-#### TC 22: Cisco BGP peer2 state
+
+#### TC 18: Cisco BGP peer2 state
 
 **Test Objective:** Verify `cbgpPeer2State` follows IPv4/IPv6 BGP session state.
 
@@ -467,23 +412,23 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 4. Shut a neighbor (`sudo config bgp shutdown neighbor <peer>` or interface shutdown) and poll until SNMP leaves Established.
 5. Restore BGP and confirm Established. On T2, document per-namespace limitation if only one table is exposed.
 
-#### TC 23: Force10 1/5 minute CPU and memory
+#### TC 19: Force10 CPU and memory utilization
 
-**Test Objective:** Verify Force10 1-minute and 5-minute CPU and memory utilization track host samples.
+**Test Objective:** Verify Force10 5-second, 1-minute, and 5-minute CPU utilization and memory utilization track host measurements.
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/snmp/test_snmp_cpu.py
+**sonic-mgmt coverage:** `tests/snmp/test_snmp_cpu.py`, `tests/snmp/test_snmp_memory.py`
 
 **Test Steps:**
 
-1. GET five-second CPU `.1.3.6.1.4.1.6027.3.10.1.2.9.1.2` as a baseline (already covered).
-2. GET `.1.3.6.1.4.1.6027.3.10.1.2.9.1.3` (1 min), `.1.4` (5 min), and `.1.5` (memory).
-3. Compare with `top -bn1` / `cat /proc/meminfo` / `psutil` samples; values must be 0..100.
-4. Apply CPU load (`stress` or a tight loop) for more than one minute and confirm 1-minute CPU rises.
-5. After load stops, confirm 1-minute and 5-minute windows decay toward idle.
+1. Determine the DUT vCPU count with host facts or `nproc`; GET the Force10 5-second CPU OID and require a non-zero integer.
+2. Start one `nohup yes > /dev/null 2>&1 &` worker per vCPU and wait 40 seconds, matching the automated load procedure.
+3. GET 5-second CPU again; compare it with the rounded non-idle CPU from the second sample of `top -bn2 -d5` and require an absolute difference no greater than 5 percentage points.
+4. GET the 1-minute CPU, 5-minute CPU, and memory utilization OIDs; require each value in 0..100. Also compare UCD-SNMP total/free/buffer/shared/cached memory with `/proc/meminfo`, adding `SReclaimable` to Linux `Cached`; require exact total memory and the size-dependent 4–12% tolerance used by the automated test for dynamic values.
+5. Keep CPU load active beyond one minute and require the 1-minute value to rise. Run the automated `/tmp/memory.py` load on systems with more than 2 GiB and require SNMP free memory to remain within the same tolerance; stop the CPU and memory workers and confirm utilization decays.
 
-#### TC 24: ENTITY hierarchy
+#### TC 20: ENTITY hierarchy
 
 **Test Objective:** Verify entPhysicalTable parent/class/name/serial relations for chassis, PSU, fan, thermal, and transceiver.
 
@@ -493,11 +438,11 @@ Existing `tests/snmp` cases cover system identity, basic interface fields, defau
 
 **Test Steps:**
 
-1. Collect platform inventory: `show platform syseeprom`, `show platform fan`, `show platform psustatus`, `show interfaces transceiver`.
-2. Walk `entPhysicalTable` `.1.3.6.1.2.1.47.1.1.1.1`.
-3. For each row, compare `entPhysicalContainedIn`, `entPhysicalClass`, `entPhysicalName`, `entPhysicalSerialNumber`, `entPhysicalModelName`, and `entPhysicalIsFRU` with STATE_DB `*_INFO` tables.
-4. Confirm transceivers nest under the correct port and PSUs/fans under chassis/drawer.
-5. Skip missing FRUs with an explicit platform reason.
+1. Collect fan-drawer, fan, PSU, thermal, and transceiver STATE_DB records, including `position_in_parent`, parent, serial, model, replaceability, and sensor fields.
+2. Walk `entPhysicalTable` and ENTITY-SENSOR-MIB; derive the expected entity and sensor indexes from each component type and position exactly as the automated test does.
+3. For fan drawers, fans, PSUs, thermals, and transceivers, require the expected OID and compare description, containment, physical class, relative position, name, serial, model, and `entPhysIsFRU` with STATE_DB (including expected empty unsupported fields).
+4. Require fan sensors to be children of their fans, PSU sensors to be children of their PSUs, thermals to be under the chassis, and transceiver sensors to be under the correct transceiver/port entity.
+5. On a PDU-backed platform, power off/on a redundant PSU and require its entity/sensor data to disappear and return; on a replaceable-fan platform, remove/reinsert a fan and require the same lifecycle.
 
 Placeholder objects (`ifPhysAddress`, `ifLastChange`, `ifSpecific`, `ifLinkUpDownTrapEnable`, `ifPromiscuousMode`, `ifConnectorPresent`, `ifCounterDiscontinuityTime`, `entPhysicalVendorType`, `entPhysicalAlias`, `entPhysicalAssetID`) may have optional stub-contract checks. Do not treat stub values as feature coverage.
 
@@ -511,7 +456,7 @@ Placeholder objects (`ifPhysAddress`, `ifLastChange`, `ifSpecific`, `ifLinkUpDow
 
 gNOI System, File, and OS are registered on supporting images. Ping and Traceroute return `Unimplemented`. FactoryReset, Healthz, Containerz, Debug, ORAS, SonicService/JWT, and gNSI are build-dependent and must be gated by runtime inventory.
 
-Existing `tests/gnmi` and `tests/telemetry` cases cover Capabilities, certificate auth, CONFIG_DB incremental/full replace and subscribe, APPL_DB DASH VNET, COUNTERS_DB get/poll/sample, selected events, System Time, cold/warm reboot, OS Verify/Activate, and KillProcess (currently skipped by marks). The cases below fill remaining functional gaps.
+Existing `tests/gnmi` and `tests/telemetry` cases cover Capabilities, certificate auth, CONFIG_DB incremental/full replace and subscribe, APPL_DB DASH VNET, COUNTERS_DB get/poll/sample, selected events, System Time, cold/warm reboot, OS Verify/Activate, and KillProcess. The cases below fill remaining functional gaps.
 
 Setup for gNMI/gNOI:
 
@@ -533,11 +478,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Discover the gNMI container/port (`docker ps | grep -E 'gnmi|telemetry'`).
-2. Run `docker exec <gnmi> gnmi_cli -insecure -capabilities -address 127.0.0.1:<port>` (or the PTF `gnmi_cli` equivalent with client certs).
-3. Confirm `JSON_IETF` is listed and `sonic-db` (and YANG models, if Translib is enabled) appear without duplicates.
-4. Compare model names/versions with files in the telemetry/gnmi image YANG bundle.
-5. Repeat with a `gnmi_noaccess` client CN and confirm Capabilities is denied (`tests/gnmi/test_gnmi.py` role path).
+1. Discover the active `gnmi` or `telemetry` container and port, then call Capabilities with the mapped client CN `test.client.gnmi.sonic`.
+2. Require a zero client return code and require both `sonic-db` and `JSON_IETF` in the response; also validate installed YANG model names/versions when Translib models are advertised.
+3. Map the CN to `gnmi_noaccess`; call Capabilities and require failure with the role name in the error.
+4. Repeat with `gnmi_readonly`, `gnmi_readwrite`, and an empty role; each must succeed and still advertise `sonic-db` plus `JSON_IETF`.
+5. Restore the default CN mapping with the `add_gnmi_client_common_name` equivalent.
 
 #### TC 2: Native Get
 
@@ -545,15 +490,15 @@ Setup for gNMI/gNOI:
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/gnmi/test_gnmi_configdb.py
+**sonic-mgmt coverage:** `tests/gnmi/test_gnmi_appldb.py`, `tests/gnmi/test_gnmi_countersdb.py`
 
 **Test Steps:**
 
-1. GET `/sonic-db:CONFIG_DB/localhost/DEVICE_METADATA/localhost` and compare with `sonic-db-cli CONFIG_DB hgetall 'DEVICE_METADATA|localhost'`.
-2. GET `/sonic-db:APPL_DB/localhost/PORT_TABLE/Ethernet0/oper_status` and compare with `sonic-db-cli APPL_DB hget 'PORT_TABLE:Ethernet0' oper_status`.
-3. GET `/sonic-db:STATE_DB/localhost` for a known table (for example `TRANSCEIVER_INFO` on hardware or `PORT_TABLE` state).
-4. GET `/sonic-db:COUNTERS_DB/localhost/COUNTERS_PORT_NAME_MAP/Ethernet0` and a COUNTERS oid field `SAI_PORT_STAT_IF_IN_ERRORS`.
-5. Issue a multi-path Get and confirm timestamps, prefixes, and JSON_IETF types.
+1. GET `/sonic-db:CONFIG_DB/localhost/DEVICE_METADATA/localhost`; compare the JSON object with `sonic-db-cli CONFIG_DB hgetall 'DEVICE_METADATA|localhost'`.
+2. Create `DASH_VNET_TABLE|Vnet1` through a gNMI APPL_DB update, then GET `.../DASH_VNET_TABLE/Vnet1/vni` and its `_DASH_VNET_TABLE` compatibility path; require one path to return string value `"1000"`, then delete the key and require both Gets to fail.
+3. For every UC queue shown by `show queue counters Ethernet0`, GET `/sonic-db:COUNTERS_DB/localhost/COUNTERS_QUEUE_NAME_MAP/Ethernet0:<queue>` and require an `oid`; an `Ethernet0:abc` key must return a gRPC error.
+4. Read Ethernet0's OID with `sonic-db-cli COUNTERS_DB hget COUNTERS_PORT_NAME_MAP Ethernet0`; GET its `/COUNTERS/<oid>` object and require `SAI_PORT_STAT_IF_IN_ERRORS`.
+5. GET one known STATE_DB object and compare it field-for-field with `sonic-db-cli STATE_DB`; issue a multi-path Get spanning the available DB targets and verify prefixes, timestamps, and JSON_IETF types.
 
 #### TC 3: Virtual and OTHERS Get
 
@@ -565,11 +510,12 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. GET documented `OTHERS` paths such as `platform/cpu`, `proc/stat`, and `proc/meminfo` using `gnmi_get` with target `OTHERS`.
-2. Compare CPU/memory with `cat /proc/stat` and `cat /proc/meminfo`.
-3. GET virtual COUNTERS paths used by `tests/telemetry/test_telemetry.py` (queue buffer, Ethernet0 counters).
-4. GET an unsupported path and confirm a canonical gRPC error.
-5. On hardware, confirm port/queue virtual paths return non-empty SAI stats.
+1. GET target `OTHERS`, path `osversion/build`; require exactly one `build_version` beginning `SONiC.` and reject `SONiC.NA`.
+2. GET target `OTHERS`, path `proc/uptime`; parse `total` as a float, wait 10 seconds, repeat, and require an increase of at least 10 seconds.
+3. GET target `COUNTERS_DB`, path `COUNTERS/Ethernet0`; require `SAI_PORT_STAT_IF_IN_ERRORS` in the response.
+4. Subscribe to the default virtual-DB Ethernet0 path for three updates; require one completion marker, three response timestamps, and three Ethernet0 updates.
+5. Subscribe ON_CHANGE to namespace `STATE_DB/NEIGH_STATE_TABLE`, modify a real BGP neighbor's state in that namespace, and require the neighbor key in the update before restoring its original state.
+6. With `create_only_config_db_buffers=true`, query `COUNTERS_QUEUE_NAME_MAP`, remove one configured buffer queue, reload, and require the returned queue count to decrease before restoring CONFIG_DB.
 
 #### TC 4: OpenConfig interface Get/Set
 
@@ -613,11 +559,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Update `PORT|Ethernet0 admin_status` to down via gNMI Set update, matching `test_gnmi_configdb_incremental_01`.
-2. Confirm `sonic-db-cli CONFIG_DB hget 'PORT|Ethernet0' admin_status` is `down` and `show interfaces status Ethernet0` is down.
-3. Set admin_status back to `up`.
-4. Send an update to an invalid table path (`PORTABC`) and confirm failure (`test_gnmi_configdb_incremental_02`).
-5. Delete a disposable leaf (temporary description) and confirm it is removed from CONFIG_DB.
+1. Select the first admin-up physical interface from `show interface status`; skip supervisor nodes without front-panel PORT data.
+2. Write JSON string `"down"` on the PTF and update `/sonic-db:CONFIG_DB/localhost/PORT/<interface>/admin_status` with gNMI Set.
+3. Require `sonic-db-cli CONFIG_DB hget 'PORT|<interface>' admin_status` and gNMI Get of the same leaf both return `down`.
+4. Update the leaf to `up`; require CONFIG_DB and gNMI Get both return `up`, then require all configured BGP neighbors to re-establish within 60 seconds.
+5. Update invalid path `/sonic-db:CONFIG_DB/localhost/PORTABC/Ethernet100/admin_status`; require the Set helper to raise an error rather than silently create a table.
 
 #### TC 7: Set operation order
 
@@ -667,7 +613,7 @@ Setup for gNMI/gNOI:
 4. Confirm no gNMI process crash (`docker exec <gnmi> ps aux | grep telemetry`).
 5. Restore `cloudtype`.
 
-#### TC 10: CONFIG_DB persistence
+#### TC 10: Full CONFIG_DB replace and persistence
 
 **Test Objective:** Verify full CONFIG_DB replace persists across config reload.
 
@@ -677,11 +623,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Perform full replace of CONFIG_DB as in `test_gnmi_configdb_full_replace_01` (admin_status down on a port).
-2. Run `sudo config save -y`.
-3. Reload with `sudo config reload -y` and wait for critical services.
-4. Confirm the replaced CONFIG_DB values are present (`show interfaces status`, `sonic-db-cli CONFIG_DB`).
-5. Restore admin_status with `sudo config interface startup Ethernet0` and `sudo config save -y`.
+1. Select the first admin-up physical interface; dump full CONFIG_DB with `sonic-cfggen -d --print-data` (or the owning frontend namespace on multi-ASIC) and require the PORT/admin_status fields exist.
+2. Change only that interface's `admin_status` to `down` in the JSON dump and replace `/sonic-db:CONFIG_DB/localhost/` with the full document.
+3. Poll CONFIG_DB for up to 30 seconds and require the interface to become `down`; verify unrelated top-level tables from the dump remain present.
+4. Run `sudo config save -y`, then `sudo config reload -y`; require the replaced value to survive and critical services to recover.
+5. Restore the interface with `sudo config interface startup <interface>`, save, and require all BGP neighbors to re-establish.
 
 #### TC 11: Subscribe ONCE
 
@@ -705,15 +651,15 @@ Setup for gNMI/gNOI:
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/gnmi/test_gnmi_configdb.py
+**sonic-mgmt coverage:** `tests/gnmi/test_gnmi_configdb.py`, `tests/gnmi/test_gnmi_countersdb.py`
 
 **Test Steps:**
 
-1. Subscribe SAMPLE to DEVICE_METADATA with a one-second interval using the existing helper (`gnmi_subscribe_streaming_sample`).
-2. Count `bgp_asn` samples and confirm cadence.
-3. Enable `suppress_redundant` and heartbeat; confirm heartbeat is not a false change.
-4. Subscribe TARGET_DEFINED to the same path and record the selected mode.
-5. Unsubscribe cleanly.
+1. For each CONFIG_DB path level—`DEVICE_METADATA` table, `localhost` key, and `bgp_asn` field—start a SAMPLE subscription using `gnmi_subscribe_streaming_sample`.
+2. Request at least five updates and require `bgp_asn` to appear at least five times for each path level.
+3. Repeat for COUNTERS_DB `COUNTERS_PORT_NAME_MAP` at table and Ethernet0-key granularity; require at least three responses containing an `oid`.
+4. Subscribe to the Ethernet0 `SAI_PORT_STAT_IF_IN_ERRORS` field and require it in at least three sampled updates.
+5. Extend the automated checks with a one-second sample interval, `suppress_redundant`, heartbeat, and TARGET_DEFINED; verify cadence and that heartbeat updates are not treated as data changes.
 
 #### TC 13: Subscribe ON_CHANGE
 
@@ -725,11 +671,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Subscribe ON_CHANGE to `/sonic-db:CONFIG_DB/localhost/DEVICE_METADATA`.
-2. Confirm initial snapshot contains key `localhost`.
-3. Change `bgp_asn` with `sonic-db-cli CONFIG_DB hset 'DEVICE_METADATA|localhost' bgp_asn <n>` several times.
-4. Confirm ordered updates without stale duplicates.
-5. Delete and recreate a disposable field and confirm delete/update notifications. Restore `bgp_asn`.
+1. For each CONFIG_DB path level—`DEVICE_METADATA`, key `localhost`, and field `bgp_asn`—start an ON_CHANGE subscription.
+2. In a parallel worker, alternately delete `bgp_asn` and set it to incrementing values every 0.5 seconds.
+3. Require at least five `bgp_asn` notifications for each path-level subscription, with ordered delete/update changes and no stale value after recreation.
+4. For the table-level subscription, parse every `json_ietf_val`; require at least three objects and require each to contain key `localhost` with field `bgp_asn`.
+5. Stop the worker and restore the original `bgp_asn` value.
 
 #### TC 14: Subscribe POLL
 
@@ -737,19 +683,19 @@ Setup for gNMI/gNOI:
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/gnmi/test_gnmi_configdb.py
+**sonic-mgmt coverage:** `tests/gnmi/test_gnmi_configdb.py`, `tests/gnmi/test_gnmi_countersdb.py`
 
 **Test Steps:**
 
-1. Subscribe POLL to DEVICE_METADATA and COUNTERS_PORT_NAME_MAP as in existing tests.
-2. Trigger poll three times and confirm one snapshot each (`bgp_asn` or `oid` count).
-3. Send a poll before subscribe is established or a malformed poll and confirm a canonical error.
-4. Compare polled COUNTERS values with `sonic-db-cli COUNTERS_DB`.
-5. Close the stream.
+1. Subscribe in POLL mode to CONFIG_DB `DEVICE_METADATA` at table, key, and `bgp_asn` field granularity; issue three polls with a one-second interval.
+2. For each path, require `bgp_asn` in at least three poll responses.
+3. Repeat for COUNTERS_DB `COUNTERS_PORT_NAME_MAP` table and Ethernet0 key; require `oid` in at least three responses.
+4. Poll COUNTERS at table, Ethernet0 OID-key, and `SAI_PORT_STAT_IF_IN_ERRORS` field granularity; require that field in every poll series and compare it with COUNTERS_DB.
+5. Send a poll before a subscription or a malformed poll and require a canonical gRPC error, then close the valid stream.
 
-#### TC 15: Subscribe lifecycle
+#### TC 15: Certificate rotation and service lifecycle
 
-**Test Objective:** Verify cancel, deadline, disconnect, server restart, and reconnect release resources and resync.
+**Test Objective:** Verify telemetry remains running without certificates and begins rejecting or accepting requests as certificates are removed, restored, or rotated.
 
 **Testbed:** Any
 
@@ -757,11 +703,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Open an ON_CHANGE subscribe and cancel from the client; confirm the server session ends (`docker logs <gnmi>`).
-2. Open a subscribe with a short deadline and confirm it terminates.
-3. Kill the client process and confirm no leftover gnmi_cli/server leak (`docker exec <gnmi> ps aux`).
-4. Restart the gNMI container (`sudo systemctl restart gnmi` or `telemetry`) and reconnect.
-5. Confirm the new stream delivers current state.
+1. Stop the telemetry service, archive its certificates, restart it, and require `is_service_fully_started` within 100 seconds even though authenticated requests cannot succeed.
+2. Restore certificates, wait for the gNMI TCP port, and issue target `OTHERS` Get for `proc/uptime`; require success within 30 seconds.
+3. Archive certificates while the service is running and repeat the same Get; require a non-zero client return code, then restore certificates and wait for the port.
+4. Archive certificates before a request, require the initial Get to fail, rotate certificates, wait for the port, and require the same Get to succeed.
+5. With working certificates, require a Get before and after a second certificate rotation to succeed, proving rotation does not require a server restart.
 
 #### TC 16: EVENTS subscribe
 
@@ -773,11 +719,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Subscribe: `gnmi_cli -t EVENTS -streaming_type ON_CHANGE -q all[heartbeat=5][usecache=false]`.
-2. Flap a BGP neighbor (`sudo config bgp shutdown neighbor <peer>`) or a link (`sudo config interface shutdown Ethernet0`).
-3. Confirm the matching event (`sonic-events-bgp:bgp-state` or link event) is received.
-4. Enable a filter (`-expected_event`) and confirm unrelated events are dropped.
-5. Restore BGP/link. Optionally reconnect with cache enabled and confirm documented cache behavior.
+1. Start the EVENTS suite with eventd healthy and telemetry configured for on-change events without cache.
+2. Run the host, SWSS, DHCP-relay, BGP, and other available `*_events.py` publishers; for each, require the expected event payload and validate it against its YANG model using `validate_yang_events.py`.
+3. For BGP/link cases, trigger the documented state transition and require the corresponding event key and fields rather than accepting any event.
+4. Exercise event filters, heartbeat, and cache options and require unrelated events to be excluded.
+5. Reset event counters, restart eventd, publish enough synthetic BGP events to overflow the default cache, and require `missed_to_cache` to increase by the expected threshold.
 
 #### TC 17: Dial-out telemetry
 
@@ -805,11 +751,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Connect with the valid client cert CN `test.client.gnmi.sonic` and confirm Capabilities succeeds.
-2. Connect with an unmapped CN and confirm Unauthenticated (`test_gnmi_authorize_failed_with_invalid_cname`).
-3. Connect with the revoked cert while CRL is served from PTF (`test_gnmi_authorize_failed_with_revoked_cert`).
-4. If password/JWT metadata is enabled on the image, try valid and invalid username/password and expired JWT.
-5. Confirm only configured mechanisms succeed.
+1. Map `test.client.gnmi.sonic` to `gnmi_noaccess`; require Capabilities to fail and include the role name. Require Capabilities with `gnmi_readonly`, `gnmi_readwrite`, and an empty role to succeed with `sonic-db` and `JSON_IETF`.
+2. Delete the valid CN mapping, add only `invalid.cname`, and attempt an APPL_DB DASH_VNET update with the original certificate; require `Unauthenticated` and gNMI log text `Failed to retrieve cert common name mapping`.
+3. Restore the valid mapping, serve the CRL from PTF, and repeat the APPL_DB write with `gnmiclient.revoked`; require `Unauthenticated` and log text `desc = Peer certificate revoked` (retry only transient CRL-download failures).
+4. Extend with wrong-CA, expired, CN/SAN-mismatch, and optional password/JWT cases; require only configured mechanisms to succeed.
+5. Stop the CRL server and restore the default client-CN mapping.
 
 #### TC 19: Authorization matrix
 
@@ -821,11 +767,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Set CN role `gnmi_config_db_noaccess` with `sonic-db-cli CONFIG_DB hset 'GNMI_CLIENT_CERT|test.client.gnmi.sonic' 'role@' gnmi_config_db_noaccess`.
-2. Attempt Get/Set/Subscribe of CONFIG_DB and confirm denial.
-3. Set `gnmi_config_db_readonly` and confirm Get/Subscribe succeed and Set fails.
-4. Set `gnmi_config_db_readwrite` and confirm Set of `DEVICE_METADATA|localhost cloudtype` succeeds.
-5. Restore the default role with `add_gnmi_client_common_name` equivalent.
+1. For CN role `gnmi_config_db_noaccess`, attempt CONFIG_DB Set, Get, and SAMPLE Subscribe; require Set/Get errors containing the role, and subscription output containing both `GRPC error` and the role.
+2. For `gnmi_config_db_readwrite`, Set `DEVICE_METADATA|localhost cloudtype` to `Public`; require success. Require Get and Subscribe to succeed, with Subscribe output containing `cloudtype`.
+3. For `gnmi_config_db_readonly`, require Set to fail with the role name while Get and Subscribe succeed and return `cloudtype`.
+4. For an empty role, require Set to fail with `write access` while Get and Subscribe succeed.
+5. Restore the default CN role and restore the original `cloudtype` value.
 
 #### TC 20: Negative Get/Set
 
@@ -837,11 +783,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. GET an unknown target (`NOT_A_DB`) and confirm gRPC error.
-2. SET with a non-JSON payload to a JSON_IETF path and confirm error.
-3. SET a very large payload and confirm bounded rejection, not a crash.
-4. Stop Redis temporarily only if safe in lab, GET CONFIG_DB, then start Redis; otherwise GET a missing table key.
-5. Confirm `docker exec <gnmi> supervisorctl status` remains RUNNING.
+1. Write JSON `"down"` and Set invalid path `/sonic-db:CONFIG_DB/localhost/PORTABC/Ethernet100/admin_status`; require the client helper to raise an exception and require no `PORTABC` table in CONFIG_DB.
+2. GET an unknown target (`NOT_A_DB`) and an invalid COUNTERS queue key (`Ethernet0:abc`); require canonical gRPC errors.
+3. SET a non-JSON payload on a JSON_IETF path and then an oversized payload; require bounded rejection without a partial CONFIG_DB write.
+4. GET a missing table/key; if Redis-unavailable handling is tested, stop Redis only in an isolated lab and require an unavailable error before restoring it.
+5. Require the gNMI service to remain running and a subsequent valid Get to succeed.
 
 #### TC 21: Multi-ASIC gNMI
 
@@ -875,6 +821,7 @@ Setup for gNMI/gNOI:
 4. Confirm all descriptions are in CONFIG_DB or none are if the request failed.
 5. Clear the test descriptions with `sudo config interface description EthernetX ""`.
 
+
 ### gNOI test cases
 
 #### TC 1: System.Time
@@ -883,15 +830,15 @@ Setup for gNMI/gNOI:
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/gnmi/test_gnoi_system.py
+**sonic-mgmt coverage:** `tests/gnmi/test_gnoi_system.py`, `tests/gnmi/test_gnoi_system_grpc.py`
 
 **Test Steps:**
 
-1. Record DUT time: `date +%s%N` (or `date +%s`).
-2. Call gNOI System.Time via `gnoi_client` / `gnoi_request(..., 'System', 'Time', '')`.
-3. Confirm the JSON `time` field is within 60 seconds of DUT clock.
-4. Call Time twice more and confirm strictly increasing values.
-5. Repeat using the Python stub path in `tests/gnmi/test_gnoi_system_grpc.py`.
+1. Record DUT epoch seconds with `date +%s` and convert it to nanoseconds.
+2. Call System.Time through `gnoi_request`; require return code 0, extract valid JSON from the response, and require a `time` field.
+3. Create a fresh authenticated gRPC channel and `SystemStub`, send `TimeRequest`, and require the response timestamp to differ from the recorded DUT time by less than 60 seconds.
+4. Call Time twice more and require monotonically increasing nanosecond values.
+5. Close the gRPC channel after the check to avoid shared SSL state or resource leakage.
 
 #### TC 2: Reboot request validation
 
@@ -899,7 +846,7 @@ Setup for gNMI/gNOI:
 
 **Testbed:** Any
 
-**sonic-mgmt coverage:** tests/gnmi/test_gnoi_system_reboot.py
+**sonic-mgmt coverage:** Not covered
 
 **Test Steps:**
 
@@ -909,9 +856,9 @@ Setup for gNMI/gNOI:
 4. Confirm uptime is unchanged and `show reboot-cause` did not record a new gNOI reboot.
 5. Do not send COLD/WARM in this case (covered by TC 3).
 
-#### TC 3: RebootStatus lifecycle
+#### TC 3: COLD and WARM reboot lifecycle
 
-**Test Objective:** Verify RebootStatus before, during, and after an accepted COLD reboot.
+**Test Objective:** Verify accepted COLD and WARM reboot requests, RebootStatus fields, actual reboot, and service recovery.
 
 **Testbed:** Hardware
 
@@ -919,11 +866,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Call RebootStatus while idle and record `active`/`count`.
-2. Send COLD Reboot with message `gnoi test reboot` (`gnoi_request` System Reboot).
-3. Immediately call RebootStatus and confirm `active=true`, reason, method=COLD, count incremented.
-4. Wait for the DUT (`wait_for_startup`) and `show system status` / critical processes.
-5. Re-apply gNMI certs (`apply_cert_config` equivalent) and confirm uptime reset.
+1. Record DUT uptime, then send System.Reboot with message `gnoi test reboot` and method COLD; require gNOI return code 0.
+2. Immediately call RebootStatus and require `active=true`, reason `gnoi test reboot`, method COLD, positive integer `when`, and integer `count >= 1`.
+3. Wait for startup with a 20-second initial delay and 600-second timeout, then require all critical processes to be running.
+4. Re-apply gNMI certificates (the automated test's post-reboot workaround), compare uptime timestamps, and require evidence that the DUT rebooted.
+5. Repeat with method WARM; require the same status-field checks with method WARM and require startup plus critical-process recovery.
 
 #### TC 4: CancelReboot
 
@@ -951,11 +898,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Confirm `snmp` is running: `docker ps | grep snmp`.
-2. Send KillProcess `{"name":"snmp","signal":1}` and confirm the container/service stops.
-3. Send KillProcess `{"name":"snmp","restart":true,"signal":1}` and confirm it returns.
-4. Send invalid name `gnmi` / empty name / `signal:2` and confirm the documented errors from `test_gnoi_killprocess.py`.
-5. Wait for critical processes (`wait_critical_processes`). Re-enable this test if still globally skipped.
+1. For each running allowlisted service (`snmp`, `dhcp_relay`, `radv`, `restapi`, `lldp`, `sshd`, `swss`, `pmon`, `rsyslog`, and `telemetry`), send KillProcess with `signal:1`; require return code 0 and require the service/container to stop.
+2. Send KillProcess for that service with `restart:true, signal:1`; require return code 0 and require the host service to run again.
+3. Send names `gnmi`, `nonexistent`, and empty string; require failure with the exact D-Bus unsupported/no-service message used by the automated parameter matrix.
+4. Send invalid or empty `restart` values and require failure with `panic` in the response, matching the automated assertion; send `signal:2` and require `KillProcess only supports SIGNAL_TERM (option 1)`.
+5. After every parameter case, wait for critical processes and require `critical_services_fully_started`; retain the suite's skip when a selected service was not initially running.
 
 #### TC 6: Ping and Traceroute unimplemented
 
@@ -1063,11 +1010,11 @@ Setup for gNMI/gNOI:
 
 **Test Steps:**
 
-1. Record current image: `show version` / `sonic-installer list`.
-2. Call OS.Verify and compare `version` with `image_facts` current image.
-3. Call Activate with the current version and expect ActivateOk.
-4. Call Activate with `invalid-image-name` and expect ActivateError `Image does not exist`.
-5. Confirm `sonic-installer list` is unchanged.
+1. Call OS.Verify; require return code 0, parse response JSON, and require a `version` field.
+2. Compare `version` exactly with the current image from `image_facts` / `sonic-installer list`.
+3. Call OS.Activate with `invalid-image-name`; require transport return code 0 but response variant `ActivateError` containing `Image does not exist`.
+4. Call OS.Activate with the exact current image name; require return code 0 and response variant `ActivateOk`.
+5. Confirm the current/next image list is unchanged by these non-install checks.
 
 #### TC 13: OS Install
 
@@ -1101,23 +1048,7 @@ Setup for gNMI/gNOI:
 4. Confirm Install mutex released by running a subsequent well-formed negative request.
 5. Remove any leftover files under the image directory.
 
-#### TC 15: Optional gNOI and gNSI services
-
-**Test Objective:** Inventory FactoryReset, Healthz, Containerz, Debug, ORAS, SonicService/JWT, and gNSI; test advertised RPCs only.
-
-**Testbed:** Hardware
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. List gRPC services (server reflection or probe RPCs) and record which are registered.
-2. For Healthz, call Get if present; expect Unimplemented for List/Check if documented.
-3. For FactoryReset, run only on a reserved DUT with PDU; otherwise skip with reason.
-4. Smoke-test SonicService ShowTechsupport or Debug whitelist if advertised.
-5. Do not fail the suite for unadvertised services.
-
-#### TC 16: gNOI RBAC
+#### TC 15: gNOI RBAC
 
 **Test Objective:** Verify readonly vs readwrite roles on System, File, and OS.
 
@@ -1181,29 +1112,14 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 
 **Test Steps:**
 
-1. GET `curl -sk -u admin:<password> https://<mgmt_ip>/.well-known/host-meta` and confirm XRD restconf=`/restconf`.
-2. GET `curl -sk -u admin:<password> -H 'Accept: application/yang-data+json' https://<mgmt_ip>/restconf/yang-library-version`.
-3. GET `curl -sk -u admin:<password> -H 'Accept: application/yang-data+json' https://<mgmt_ip>/restconf/data/ietf-yang-library:modules-state`.
-4. GET `curl -sk -u admin:<password> -H 'Accept: application/yang-data+json' https://<mgmt_ip>/restconf/data/ietf-restconf-monitoring:restconf-state/capabilities`.
-5. GET `curl -sk -u admin:<password> -H 'Accept: application/yang-data+json' https://<mgmt_ip>/restconf/operations` and optionally download a YANG file from `/models/yang/`.
+1. GET `/.well-known/host-meta`; expect HTTP 200, an XRD media type/body, and a RESTCONF link whose `href` resolves to `/restconf`.
+2. GET `/restconf/yang-library-version` with `Accept: application/yang-data+json`; expect 200, that media type, and the YANG-library version implemented by the image.
+3. GET `/restconf/data/ietf-yang-library:modules-state`; expect 200 and a non-empty module list. For sampled modules, require name, revision (when versioned), namespace, conformance type, and a usable schema/model URL.
+4. GET `/restconf/data/ietf-restconf-monitoring:restconf-state/capabilities`; expect 200 and require the RESTCONF base capability plus every query capability later exercised (`depth`, `content`, or `fields`).
+5. GET `/restconf/operations`; expect 200 and a well-formed operations container whose RPC names belong to modules in the YANG library.
+6. Download one advertised schema from `/models/yang/<module>.yang`; expect 200 and YANG text whose `module` name matches the modules-state entry. Any advertised URL that returns 404 is a failure.
 
-#### TC 3: Swagger UI
-
-**Test Objective:** Verify `/ui` loads and advertised OpenAPI paths match discoverable models.
-
-**Testbed:** Any
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. GET `curl -sk -u admin:<password> -o /dev/null -w '%{http_code}' https://<mgmt_ip>/ui` and expect 200.
-2. Open an advertised OpenAPI definition from the UI page.
-3. Pick one path (for example openconfig-interfaces) and GET the corresponding `/restconf/data/...` URL.
-4. Confirm the UI path and RESTCONF path refer to the same model.
-5. Skip if `/ui` is not packaged, with an explicit image reason.
-
-#### TC 4: GET data
+#### TC 3: GET data
 
 **Test Objective:** Verify GET of containers, lists, leaves, config, and state matches CLI/Redis.
 
@@ -1213,13 +1129,14 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 
 **Test Steps:**
 
-1. GET `curl -sk -u admin:<password> -H 'Accept: application/yang-data+json' https://<mgmt_ip>/restconf/data/openconfig-interfaces:interfaces`.
-2. GET a keyed interface: `/restconf/data/openconfig-interfaces:interfaces/interface=Ethernet0`.
-3. GET `/restconf/data/sonic-port:sonic-port/PORT/PORT_LIST=Ethernet0/admin_status`.
-4. Compare with `show interfaces status Ethernet0` and `sonic-db-cli CONFIG_DB hget 'PORT|Ethernet0' admin_status`.
-5. GET a state leaf (oper-status) and compare with APPL_DB `oper_status`.
+1. GET `/restconf/data/openconfig-interfaces:interfaces` with `Accept: application/yang-data+json`; expect HTTP 200, that response media type, and a non-empty `interface` list.
+2. GET keyed resource `/restconf/data/openconfig-interfaces:interfaces/interface=Ethernet0`; expect 200 and exactly one interface whose key/name is `Ethernet0`; an unknown key must return 404 with `ietf-restconf:errors`.
+3. GET leaf `/restconf/data/sonic-port:sonic-port/PORT/PORT_LIST=Ethernet0/admin_status`; expect 200, a schema-valid JSON leaf value (`up` or `down`), and no unrelated list entries.
+4. Compare the returned config values with `show interfaces status Ethernet0` and `sonic-db-cli CONFIG_DB hget 'PORT|Ethernet0' admin_status`; require exact agreement after allowing normal propagation time.
+5. GET OpenConfig `state/oper-status`; expect 200 and compare it with `sonic-db-cli APPL_DB hget 'PORT_TABLE:Ethernet0' oper_status` / `show interfaces status`; require equivalent UP/DOWN values.
+6. GET the parent container and selected list/leaf URLs twice; require stable keys and JSON types, while allowing timestamps/counters to change.
 
-#### TC 5: HEAD
+#### TC 4: HEAD
 
 **Test Objective:** Verify HEAD returns GET status/headers with an empty body.
 
@@ -1235,7 +1152,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. HEAD a missing resource and confirm 404.
 5. Confirm Content-Length is present on HEAD of an existing resource.
 
-#### TC 6: OPTIONS
+#### TC 5: OPTIONS
 
 **Test Objective:** Verify OPTIONS Allow/Accept-Patch match the YANG node type.
 
@@ -1251,7 +1168,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. OPTIONS `/restconf/operations` and a state-only node; confirm write methods are absent where required.
 5. OPTIONS an unknown path and confirm 404 or documented Allow.
 
-#### TC 7: POST create
+#### TC 6: POST create
 
 **Test Objective:** Verify POST creates a disposable object and duplicate POST conflicts.
 
@@ -1267,7 +1184,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. POST the same object again and expect 409 with `ietf-restconf:errors`.
 5. DELETE the VLAN (`sudo config vlan del 4094` or REST DELETE).
 
-#### TC 8: PUT replace
+#### TC 7: PUT replace
 
 **Test Objective:** Verify PUT create/replace and defaulting of omitted non-default leaves.
 
@@ -1283,7 +1200,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. Confirm `show interfaces status Ethernet0`.
 5. Restore original MTU/admin_status with `sudo config interface ...`.
 
-#### TC 9: PATCH merge
+#### TC 8: PATCH merge
 
 **Test Objective:** Verify PATCH changes only supplied leaves and is idempotent.
 
@@ -1299,7 +1216,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. PATCH admin_status to `up`.
 5. Confirm BGP/neighbors recover if the port was in use, or use a spare port.
 
-#### TC 10: YANG Patch
+#### TC 9: YANG Patch
 
 **Test Objective:** Verify YANG Patch multi-edit success and atomic failure.
 
@@ -1315,7 +1232,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. Confirm per-edit status and that the first edit was rolled back if atomicity is advertised.
 5. Restore descriptions.
 
-#### TC 11: DELETE
+#### TC 10: DELETE
 
 **Test Objective:** Verify DELETE of leaf/list/container and repeated DELETE.
 
@@ -1331,7 +1248,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. DELETE again and expect 404 / data-missing.
 5. If capabilities include `deleteEmptyEntry`, DELETE with `?deleteEmptyEntry=true` on a parent and confirm empty-parent cleanup.
 
-#### TC 12: RPC operations
+#### TC 11: RPC operations
 
 **Test Objective:** Verify POST to `/restconf/operations` for a safe RPC and structured errors.
 
@@ -1347,7 +1264,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. POST malformed JSON and an unknown RPC name; expect 400/404 and `ietf-restconf:errors`.
 5. Skip if no safe RPC is advertised.
 
-#### TC 13: Query parameters
+#### TC 12: Query parameters
 
 **Test Objective:** Verify `depth`, `content`, and `fields` filter GET subtrees.
 
@@ -1363,7 +1280,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. Confirm capabilities include the corresponding URNs from TC 2.
 5. If the image ignores query parameters, record not-supported rather than fail.
 
-#### TC 14: Invalid query parameters
+#### TC 13: Invalid query parameters
 
 **Test Objective:** Verify unknown or illegal query parameters return 400/405.
 
@@ -1379,7 +1296,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. DELETE with `?depth=1`.
 5. Confirm 400/405 and `ietf-restconf:errors`; confirm no config change.
 
-#### TC 15: Basic authentication
+#### TC 14: Basic authentication
 
 **Test Objective:** Verify HTTP Basic succeeds only with a valid admin-capable user.
 
@@ -1395,7 +1312,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. If a non-admin user exists, GET may succeed and PATCH must return 403.
 5. Confirm `sonic-db-cli CONFIG_DB hget 'REST_SERVER|default' client_auth` includes password/user.
 
-#### TC 16: JWT authentication
+#### TC 15: JWT authentication
 
 **Test Objective:** Verify JWT issue/use/expiry if `/authenticate` exists.
 
@@ -1411,7 +1328,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. GET with a tampered/expired token and expect 401.
 5. Do not require JWT on images that only support Basic/cert.
 
-#### TC 17: Client certificate authentication
+#### TC 16: Client certificate authentication
 
 **Test Objective:** Verify cert-mode RESTCONF accepts only mapped trusted certificates.
 
@@ -1427,7 +1344,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. GET with an unknown/revoked client cert and expect failure.
 5. Restore `client_auth` to `user` and restart mgmt-framework.
 
-#### TC 18: Authorization
+#### TC 17: Authorization
 
 **Test Objective:** Verify readonly/noaccess cannot write; admin writes succeed.
 
@@ -1443,7 +1360,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. POST a VLAN as noaccess/readonly and expect 403.
 5. Restore Ethernet0 admin_status with `sudo config interface startup Ethernet0`.
 
-#### TC 19: Media type and schema errors
+#### TC 18: Media type and schema errors
 
 **Test Objective:** Verify wrong Content-Type and invalid JSON/YANG data return 400/415 without commit.
 
@@ -1459,55 +1376,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. Confirm CONFIG_DB admin_status unchanged.
 5. PATCH with wrong module prefix and expect 400.
 
-#### TC 20: Resource errors
-
-**Test Objective:** Verify 404, 409, and 405 mappings and error-tag values.
-
-**Testbed:** Any
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. GET a missing VLAN `/VLAN_LIST=Vlan4093` and expect 404.
-2. POST a duplicate VLAN and expect 409.
-3. PUT/PATCH a method not allowed on a state-only node and expect 405.
-4. Parse `ietf-restconf:errors` error-type and error-tag.
-5. Confirm no unexpected VLAN remains in `show vlan brief`.
-
-#### TC 21: Accept-Version
-
-**Test Objective:** Verify Accept-Version handling against the YANG bundle version.
-
-**Testbed:** Any
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. GET modules-state `module-set-id` / bundle version.
-2. GET a data resource without `Accept-Version` and expect success.
-3. GET with `Accept-Version: 1.0.0` (or current) and with a malformed header.
-4. GET with an unsupported future version and expect 400 operation-not-supported.
-5. Confirm OpenAPI-only paths ignore Accept-Version if that is documented.
-
-#### TC 22: Conditional headers
-
-**Test Objective:** Verify ETag/If-Match behavior on the running image.
-
-**Testbed:** Any
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. GET a resource and record ETag/Last-Modified if present.
-2. GET/PATCH with `If-Match: "*"` and `If-Modified-Since` in the past.
-3. Confirm the image either honors them or ignores them consistently (HLD: ignored).
-4. Do not fail if headers are absent.
-5. Confirm the PATCH still applies or is ignored per observed rules.
-
-#### TC 23: Cross-NBI consistency
+#### TC 19: Cross-NBI consistency
 
 **Test Objective:** Verify RESTCONF writes are visible in CLI/Redis/gNMI and the reverse.
 
@@ -1523,7 +1392,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. Set description via `sudo config interface description Ethernet0 from-cli` and GET via RESTCONF.
 5. Clear the description.
 
-#### TC 24: Persistence
+#### TC 20: Persistence
 
 **Test Objective:** Verify RESTCONF config survives mgmt-framework restart and config reload.
 
@@ -1539,7 +1408,7 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. Confirm state-only data was not persisted.
 5. Clear the description.
 
-#### TC 25: Concurrency
+#### TC 21: Concurrency
 
 **Test Objective:** Verify parallel GETs succeed and overlapping writes do not tear state.
 
@@ -1555,53 +1424,6 @@ Discover JWT only when `/authenticate` and JWT mode are present. Basic auth requ
 4. If 409 in-use is returned, confirm it is deterministic.
 5. Restore the leaf.
 
-#### TC 26: Multi-ASIC RESTCONF
-
-**Test Objective:** Verify per-namespace interface objects do not collide on T2.
-
-**Testbed:** Hardware
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. List interfaces per ASIC with `show interfaces status` and namespace mapping.
-2. GET Ethernet interfaces owned by different ASICs.
-3. PATCH mtu on one ASIC-owned port.
-4. Confirm only that port’s CONFIG_DB/namespace changed (`sonic-db-cli -n asicN`).
-5. Restore mtu.
-
-#### TC 27: Notifications unsupported
-
-**Test Objective:** Verify RESTCONF notification streams are not advertised and are rejected.
-
-**Testbed:** Any
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. Read capabilities and confirm no notification URN.
-2. GET/POST a notifications URL if one exists (`/restconf/streams`).
-3. Expect 404/405 or missing capability.
-4. Document that monitoring must use gNMI Subscribe.
-5. Confirm the REST server stays healthy.
-
-#### TC 28: Server restart during requests
-
-**Test Objective:** Verify mgmt-framework restart and malformed-request soak do not panic.
-
-**Testbed:** Any
-
-**sonic-mgmt coverage:** Not covered
-
-**Test Steps:**
-
-1. Start a loop of GET `/restconf/data/openconfig-interfaces:interfaces`.
-2. Restart `sudo systemctl restart mgmt-framework` mid-loop.
-3. Confirm GETs recover to 200.
-4. Send 50 malformed PATCH bodies; expect 400s.
-5. Confirm `docker ps | grep mgmt-framework` is Up and logs have no panic.
 
 Protocol, discovery, security, CRUD, persistence, and concurrency run on Virtual and Hardware when `mgmt-framework` is enabled. Platform YANG (optics, PSU, fan, ASIC counters) is Hardware-only.
 
