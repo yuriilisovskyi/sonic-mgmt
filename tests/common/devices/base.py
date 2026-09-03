@@ -9,6 +9,8 @@ from multiprocessing.pool import ThreadPool
 import ansible
 
 from tests.common.errors import RunAnsibleModuleFail
+from tests.common.helpers.ssh_known_hosts import get_ssh_host_key_error_host, is_ssh_host_key_error, \
+    refresh_ssh_host_key
 
 logger = logging.getLogger(__name__)
 
@@ -154,9 +156,10 @@ class AnsibleHostBase(object):
 
         module_args = json.loads(json.dumps(module_args, cls=AnsibleHostBase.CustomEncoder))
         complex_args = json.loads(json.dumps(complex_args, cls=AnsibleHostBase.CustomEncoder))
-        with suppress_signal_registration_for_non_main_thread():
-            res = self.module(*module_args, **complex_args)[self.hostname]
-            res.encoder = AnsibleHostBase.CustomEncoder
+        res = self._exec_module(module_args, complex_args)
+
+        if res.is_failed and self._refresh_ssh_host_key(res):
+            res = self._exec_module(module_args, complex_args)
 
         if verbose:
             logger.debug(
@@ -185,6 +188,37 @@ class AnsibleHostBase(object):
             raise RunAnsibleModuleFail("run module {} failed".format(self.module_name), res)
 
         return res
+
+    def _exec_module(self, module_args, complex_args):
+        with suppress_signal_registration_for_non_main_thread():
+            res = self.module(*module_args, **complex_args)[self.hostname]
+            res.encoder = AnsibleHostBase.CustomEncoder
+        return res
+
+    def _refresh_ssh_host_key(self, res):
+        """Record the current SSH host key of the device when a module failed because of a stale one.
+
+        Connections to network devices (network_cli) verify the SSH host key of the device against
+        the local known_hosts file regardless of the host_key_checking setting in ansible.cfg. A
+        device that has been re-deployed offers a new host key, which makes every module run
+        against it fail until the key recorded locally is updated.
+
+        Returns:
+            True when the recorded host key was updated and running the module again makes sense.
+        """
+        msg = res.get('msg')
+        if not is_ssh_host_key_error(msg):
+            return False
+
+        # Not every device class exposes a management IP, and looking the attribute up with
+        # getattr() would go through the __getattr__ implementations that run ansible modules.
+        host = get_ssh_host_key_error_host(msg) or self.__dict__.get('mgmt_ip')
+        if not host:
+            return False
+
+        logger.warning("[{}] AnsibleModule::{} failed with '{}', refreshing the SSH host key recorded for {}"
+                       .format(self.hostname, self.module_name, msg, host))
+        return refresh_ssh_host_key(host)
 
 
 class NeighborDevice(dict):
