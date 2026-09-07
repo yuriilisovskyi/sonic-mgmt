@@ -38,8 +38,9 @@ REMOTE_HOST_MAC = "00:aa:bb:cc:dd:02"
 
 def _vlans_ipv4(topo, min_count=1):
     vlans = [v for v in topo["vlans"] if v.get("ipv4")]
-    if len(vlans) < min_count:
-        pytest.skip("Need at least {} IPv4 VLAN(s)".format(min_count))
+    pytest_assert(
+        len(vlans) >= min_count,
+        "Failed to provide {} IPv4 VLAN(s) for SAG/IRB tests (found {})".format(min_count, len(vlans)))
     return vlans
 
 

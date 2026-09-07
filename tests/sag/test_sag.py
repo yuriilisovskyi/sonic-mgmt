@@ -71,8 +71,9 @@ def _first_ipv4_vlan(sag_topo):
 
 def _two_ipv4_vlans(sag_topo):
     vlans = [v for v in sag_topo["vlans"] if v.get("ipv4")]
-    if len(vlans) < 2:
-        pytest.skip("Inter-VLAN SAG tests require at least two IPv4 VLAN interfaces")
+    pytest_assert(
+        len(vlans) >= 2,
+        "Failed to provide two IPv4 VLANs for inter-VLAN SAG routing (found {})".format(len(vlans)))
     return vlans[0], vlans[1]
 
 
@@ -110,7 +111,7 @@ def test_sag_ping(ptfadapter, sag_enabled):
 
 
 def test_sag_route(ptfadapter, sag_enabled):
-    """Inter-VLAN routing over SAG when two VLANs exist."""
+    """Inter-VLAN routing over SAG. A second VLAN is created when the DUT has only one."""
     topo = sag_enabled
     vlan1, vlan2 = _two_ipv4_vlans(topo)
     require_min_vlan_members(vlan1, 1, "VLAN1 needs a member port")
