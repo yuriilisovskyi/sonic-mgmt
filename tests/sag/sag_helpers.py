@@ -1,8 +1,10 @@
 """Helpers for Static Anycast Gateway (SAG) and Asymmetric IRB tests."""
+import ipaddress
 import json
 import logging
 import time
 
+import pytest
 from tests.common.helpers.assertions import pytest_assert
 from tests.common.utilities import wait_until
 
@@ -280,3 +282,135 @@ def host_ip_from_gateway(gateway_ip, host_id):
     parts = gateway_ip.split(".")
     parts[-1] = str(host_id)
     return ".".join(parts)
+
+
+EXTRA_VLAN_ID_START = 200
+EXTRA_VLAN_SUBNET_START = 200
+
+
+def _portchannel_member_ports(mg_facts):
+    members = set()
+    for pc in (mg_facts.get("minigraph_portchannels") or {}).values():
+        members.update(pc.get("members") or [])
+    return members
+
+
+def _pick_unused_vlan_id(existing_ids):
+    vid = EXTRA_VLAN_ID_START
+    while vid in existing_ids or vid in (0, 1, 4095):
+        vid += 1
+        pytest_assert(vid < 4095, "Could not find a free VLAN ID for inter-VLAN SAG setup")
+    return vid
+
+
+def _pick_unused_ipv4_prefix(existing_prefixes):
+    networks = []
+    for prefix in existing_prefixes:
+        if not prefix or ":" in str(prefix):
+            continue
+        try:
+            networks.append(ipaddress.ip_network(prefix, strict=False))
+        except ValueError:
+            continue
+    for host_octet in range(EXTRA_VLAN_SUBNET_START, 250):
+        candidate = "192.168.{}.1/24".format(host_octet)
+        cand_net = ipaddress.ip_network(candidate, strict=False)
+        if any(cand_net.overlaps(net) for net in networks):
+            continue
+        return candidate, "192.168.{}.1".format(host_octet)
+    pytest.fail("Could not find a free IPv4 subnet for inter-VLAN SAG setup")
+
+
+def _vlan_member_tagging(duthost, vlan_name, port):
+    result = duthost.shell(
+        'sonic-db-cli CONFIG_DB HGET "VLAN_MEMBER|{}|{}" tagging_mode'.format(vlan_name, port),
+        module_ignore_errors=True)
+    return (result.get("stdout") or "untagged").strip() or "untagged"
+
+
+def _select_port_to_move(src_vlan, mg_facts):
+    pytest_assert(
+        len(src_vlan["members"]) >= 2,
+        "Need at least two VLAN member ports to create a second VLAN for inter-VLAN routing")
+    pc_members = _portchannel_member_ports(mg_facts)
+    candidates = [m for m in src_vlan["members"] if m["port"] not in pc_members]
+    if not candidates:
+        candidates = list(src_vlan["members"])
+    # Keep the first member on the original VLAN; move a later one.
+    if candidates[0]["port"] == src_vlan["members"][0]["port"] and len(candidates) > 1:
+        return candidates[-1]
+    return candidates[-1]
+
+
+def ensure_second_ipv4_vlan(duthost, sag_topo):
+    """Create a second IPv4 VLAN when the DUT only has one, then enable SAG on it.
+
+    A downlink is moved from the existing VLAN into a new untagged VLAN so
+    inter-VLAN routing tests can run on t0 (typically a single Vlan1000).
+    Returns the created VLAN dict, or None if two IPv4 VLANs already exist.
+    """
+    ipv4_vlans = [vlan for vlan in sag_topo["vlans"] if vlan.get("ipv4")]
+    pytest_assert(ipv4_vlans, "Need at least one IPv4 VLAN to build inter-VLAN SAG topology")
+    if len(ipv4_vlans) >= 2:
+        return None
+
+    src_vlan = ipv4_vlans[0]
+    mg_facts = sag_topo.get("mg_facts") or {}
+    moved = _select_port_to_move(src_vlan, mg_facts)
+    tagging_mode = _vlan_member_tagging(duthost, src_vlan["name"], moved["port"])
+    existing_ids = {vlan["vlan_id"] for vlan in sag_topo["vlans"]}
+    vid = _pick_unused_vlan_id(existing_ids)
+    existing_prefixes = [vlan.get("ipv4_prefix") for vlan in sag_topo["vlans"]]
+    prefix, gateway = _pick_unused_ipv4_prefix(existing_prefixes)
+    vlan_name = "Vlan{}".format(vid)
+
+    logger.info(
+        "Creating second IPv4 VLAN %s ip %s by moving %s from %s",
+        vlan_name, prefix, moved["port"], src_vlan["name"])
+    duthost.shell("config vlan member del {} {}".format(src_vlan["vlan_id"], moved["port"]))
+    time.sleep(1)
+    duthost.shell("config vlan add {}".format(vid))
+    duthost.shell("config vlan member add -u {} {}".format(vid, moved["port"]))
+    duthost.shell("config interface ip add {} {}".format(vlan_name, prefix))
+    set_sag_enabled(duthost, vid, True)
+    pytest_assert(
+        wait_until(30, 2, 2, kernel_addr_present, duthost, vlan_name, gateway),
+        "IPv4 address {} was not programmed on {}".format(gateway, vlan_name))
+    wait_for_kernel_mac(duthost, vlan_name, SAG_MAC)
+
+    src_vlan["members"] = [member for member in src_vlan["members"] if member["port"] != moved["port"]]
+    created = {
+        "name": vlan_name,
+        "vlan_id": vid,
+        "ipv4": gateway,
+        "ipv4_prefix": prefix,
+        "ipv6": None,
+        "members": [moved],
+        "tagged": False,
+        "created_by_test": True,
+        "orig_vlan_id": src_vlan["vlan_id"],
+        "orig_port": moved["port"],
+        "orig_tagging_mode": tagging_mode,
+    }
+    sag_topo["vlans"].append(created)
+    sag_topo["created_vlan"] = created
+    return created
+
+
+def remove_created_ipv4_vlan(duthost, created):
+    """Remove a VLAN created by ensure_second_ipv4_vlan and restore the original member."""
+    if not created:
+        return
+    vid = created["vlan_id"]
+    port = created["orig_port"]
+    orig_vid = created["orig_vlan_id"]
+    prefix = created["ipv4_prefix"]
+    logger.info("Removing test VLAN Vlan%s and restoring %s to VLAN %s", vid, port, orig_vid)
+    set_sag_enabled(duthost, vid, False)
+    duthost.shell("config interface ip remove Vlan{} {}".format(vid, prefix), module_ignore_errors=True)
+    duthost.shell("config vlan member del {} {}".format(vid, port), module_ignore_errors=True)
+    duthost.shell("config vlan del {}".format(vid), module_ignore_errors=True)
+    tagged = created.get("orig_tagging_mode") == "tagged"
+    member_cmd = "config vlan member add {} {} {}".format(
+        "" if tagged else "-u", orig_vid, port)
+    duthost.shell(" ".join(member_cmd.split()), module_ignore_errors=True)

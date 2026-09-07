@@ -6,7 +6,9 @@ from tests.sag.sag_helpers import (
     SAG_MAC,
     add_sag_mac,
     del_sag_mac,
+    ensure_second_ipv4_vlan,
     parse_vlan_interfaces,
+    remove_created_ipv4_vlan,
     sag_cli_supported,
     set_sag_enabled,
 )
@@ -52,17 +54,23 @@ def sag_enabled(sag_topo):
             add_sag_mac(peer, SAG_MAC)
             for vid in vlan_ids:
                 set_sag_enabled(peer, vid, True)
-    yield sag_topo
-    for vid in vlan_ids:
-        set_sag_enabled(duthost, vid, False)
-    del_sag_mac(duthost, SAG_MAC)
-    if len(sag_topo["duthosts"]) > 1:
-        for peer in sag_topo["duthosts"]:
-            if peer.hostname == duthost.hostname:
-                continue
-            for vid in vlan_ids:
-                set_sag_enabled(peer, vid, False)
-            del_sag_mac(peer, SAG_MAC)
+    created_vlan = None
+    try:
+        # t0 typically has a single VLAN; create a second IPv4 VLAN for routing/IRB cases.
+        created_vlan = ensure_second_ipv4_vlan(duthost, sag_topo)
+        yield sag_topo
+    finally:
+        remove_created_ipv4_vlan(duthost, created_vlan)
+        for vid in vlan_ids:
+            set_sag_enabled(duthost, vid, False)
+        del_sag_mac(duthost, SAG_MAC)
+        if len(sag_topo["duthosts"]) > 1:
+            for peer in sag_topo["duthosts"]:
+                if peer.hostname == duthost.hostname:
+                    continue
+                for vid in vlan_ids:
+                    set_sag_enabled(peer, vid, False)
+                del_sag_mac(peer, SAG_MAC)
 
 
 @pytest.fixture(scope="module", autouse=True)

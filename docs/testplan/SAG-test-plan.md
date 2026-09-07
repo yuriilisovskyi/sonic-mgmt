@@ -129,14 +129,16 @@ The following test cases #1 ~ #5 are discussed and verified using IPv4 address f
   2. config mac address of SAG1 using CLI
   3. config ipv4 address of SAG1 using CLI
   4. enable SAG using CLI
-  5. config ipv4 address of vlan interface (VLAN2)
-  6. flush all neighbor of host2 and then let host2 ping VLAN2
-  7. flush all neighbor of host1 and then let host1 ping host2
-  8. verify SAG in the neighbor of host1
+  5. If the DUT has only one IPv4 VLAN, create VLAN2: move one downlink out of VLAN1, `config vlan add`, add the port untagged, and `config interface ip add` a free IPv4 prefix; enable SAG on VLAN2
+  6. config ipv4 address of vlan interface (VLAN2) when it is not already present
+  7. flush all neighbor of host2 and then let host2 ping VLAN2
+  8. flush all neighbor of host1 and then let host1 ping host2
+  9. verify SAG in the neighbor of host1
+  10. restore VLAN membership if VLAN2 was created for the test
 
 - Pass/Fail Criteria
-  - Test case is pass if host2 is pingable after step 7
-  - Test case is pass if SAG1 is found as neighbor of host1 after step 8
+  - Test case is pass if host2 is pingable after step 8
+  - Test case is pass if SAG1 is found as neighbor of host1 after step 9
 
 ### Test Case # 3: Testing pingable and reachable over SAG after changing mac address using CLI to setup SAG
 
